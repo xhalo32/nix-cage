@@ -20,7 +20,7 @@ mount_suffixes = [
 ]
 
 def get_default_config():
-  rw = ["."]
+  rw = []
   ro = ["/"]
   dev = ["/dev"]
   tmpfs = [
@@ -56,7 +56,9 @@ def get_default_config():
       "--unshare-ipc",
       "--unshare-cgroup",
       "--unshare-uts",
-      "--hostname", "localhost"
+      "--unshare-pid",
+      "--hostname", "localhost",
+      "--proc", "/proc",
     ],
     "nix-shell":  [],
   }
@@ -206,12 +208,12 @@ def make_command(config):
 def load_config(config, arguments, rest):
   files = []
   filepath = abspath(arguments["config"])
+  # we take config given at filepath
+  #  and all the ones with the same name in parent dirs, if found
   while True:
     if exists(filepath):
       files.insert(0, filepath)
-    parts = splitfile(filepath)
-    name = parts[1]
-    dir = parts[0]
+    dir, name = splitfile(filepath)
     next_filepath = normalizepath(joinpath(dirname(dir), name))
     if next_filepath != filepath:
       filepath = next_filepath
