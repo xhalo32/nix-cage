@@ -1,7 +1,14 @@
-{ pkgs ? import <nixpkgs> {}, ... }:
-with pkgs; stdenv.mkDerivation rec {
+{
+  lib,
+  stdenv,
+  makeWrapper,
+  python311,
+  bubblewrap,
+  nix,
+}:
+stdenv.mkDerivation rec {
   name = "nix-cage";
-  buildInputs = [ python36 bubblewrap nix ];
+  buildInputs = [ python311 bubblewrap nix ];
   nativeBuildInputs = [ makeWrapper ];
   src = ./.;
 
@@ -17,7 +24,7 @@ with pkgs; stdenv.mkDerivation rec {
     cp       $src/${name} $out/bin
     chmod +x $out/bin/${name}
 
-    wrapProgram $out/bin/${name} --prefix PATH : ${stdenv.lib.makeBinPath [
+    wrapProgram $out/bin/${name} --prefix PATH : ${lib.makeBinPath [
       bubblewrap
       nix
     ]}
@@ -31,7 +38,7 @@ with pkgs; stdenv.mkDerivation rec {
       Sandboxed environments with bwrap and nix-shell
     '';
 
-    license = stdenv.lib.licenses.mit;
-    platforms = stdenv.lib.platforms.linux;
+    license = lib.licenses.mit;
+    platforms = lib.platforms.linux;
   };
 }
