@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 from os import execve, getcwd, chdir, makedirs
 from os.path import isabs, abspath, expanduser, basename, dirname, realpath, exists, split as splitfile, normpath as normalizepath, join as joinpath
 from shutil import which
-from shlex import quote as shell_escape
+import shlex
 from os import environ, sep
 from sys import stderr
 from functools import reduce
@@ -22,7 +22,7 @@ mount_suffixes = [
 def get_default_config():
   rw = []
   ro = ["/"]
-  dev = ["/dev"]
+  dev = ["/dev"]  # TODO: this is too permissive
   tmpfs = [
     "/tmp",
     "/home",
@@ -194,16 +194,21 @@ def make_command(config):
             config["environment"].items(), []))
 
   bwrap_flags = config["arguments"]["bwrap"]
-  if exists("shell.nix"):
-    shell = [which("nix-shell")]
-    shell_flags = config["arguments"]["nix-shell"] + [
-      "--command", config["arguments"]["command"]
-    ]
+  if run := config["arguments"].get("run"):  # expected to be a list to exec
+    run_args = run
+  elif exists("shell.nix"):
+    run_args = \
+      [which("nix-shell")] + \
+      config["arguments"]["nix-shell"] + \
+      ["--command", config["arguments"]["command"]]
   else:
-    shell = [which(environ.get("SHELL", "bash"))]
-    shell_flags = ["-c", config["arguments"]["command"]] if config["arguments"]["command"] else []
+    run_command = config["arguments"]["command"]
+    if run_command:
+      run_args = shlex.split(run_command)
+    else:
+      run_args = [which(environ.get("SHELL", "bash"))]
 
-  return command, [basename(command)] + mounts + env + bwrap_flags + shell + shell_flags
+  return command, [basename(command)] + mounts + env + bwrap_flags + run_args
 
 def load_config(config, arguments, rest):
   files = []
@@ -224,7 +229,7 @@ def load_config(config, arguments, rest):
     with open(filepath, "r") as stream:
       overlay_config = json_unmarshal(stream)
       global_mode = overlay_config.get("mode", config["mode"])
-      for section in ["mounts", "environment", "arguments"]:
+      for section in ["mounts", "environment", "arguments", "flags"]:
         overlay_mode = overlay_config.get("mode", global_mode)
         overlay_section_mode = overlay_config.get(section, {}).get("mode", overlay_mode)
         config[section] = merge(
@@ -246,6 +251,20 @@ def load_config(config, arguments, rest):
       config["mounts"][suffix].append(path)
     else:
       config["mounts"][suffix].append((path, path,))
+
+  # extra mounts based on common mount flags
+  # first make a set of all flags that are true in config
+  flags = set(k for k, v in config.get("flags", {}).get("set", {}).items() if v)
+  # then add some added from arguments
+  flags.update({k for k, v in arguments.items() if k in {"x11", "pulseaudio", "wayland"} and v})
+  if "x11" in flags:
+    if xauth_path := environ.get('XAUTHORITY'):
+      config["mounts"]["ro"] += [xauth_path]
+    config["mounts"]["rw"] += ["/tmp/.X11-unix"]
+  if "pulseaudio" in flags:
+    config["mounts"]["ro"] += ["/run/user/{UID}/pulse".format(**environ)]
+  if "wayland" in flags:
+    config["mounts"]["ro"] += ["/run/user/{UID}/wayland-0".format(**environ)]
 
   ##
 
@@ -313,6 +332,9 @@ if __name__ == "__main__":
   p.add_argument("--command", help="command to execute inside the sandbox")
   p.add_argument("--show-config", help="dumps config in JSON and exit", action="store_true")
   p.add_argument("--cd", "-C", help="change to directory before doing anything", default=getcwd())
+  p.add_argument("--x11", help="bind some stuff to enable x11", action="store_true")
+  p.add_argument("--pulseaudio", help="bind some stuff to enable pulseaudio", action="store_true")
+  p.add_argument("--wayland", help="bind some stuff to enable wayland", action="store_true")
 
   arguments, rest = p.parse_known_args()
   main(arguments.__dict__, rest)
