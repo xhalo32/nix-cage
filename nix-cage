@@ -1,319 +1,546 @@
 #!/usr/bin/env python
-from argparse import ArgumentParser
-from os import execve, getcwd, chdir, makedirs
-from os.path import isabs, abspath, expanduser, basename, dirname, realpath, exists, split as splitfile, normpath as normalizepath, join as joinpath
-from shutil import which
 import shlex
-from os import environ, sep
-from sys import stderr
-from functools import reduce
-from json import load as json_unmarshal, dump as json_marshal, dumps as json_marshal_str
+import sys
+import os
+import re
+from copy import copy
+from argparse import ArgumentParser, BooleanOptionalAction, RawDescriptionHelpFormatter
+from shutil import which
+from pathlib import Path
+import json
 from pwd import getpwnam
-from string import Template
-from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum
 
-mount_suffixes = [
-    "ro",
-    "rw",
-    "dev",
-    "tmpfs"
-]
+from typing import Dict, List, Optional, Tuple, Union
 
-def get_default_config():
-    rw = []
-    ro = ["/"]
-    dev = ["/dev"]  # TODO: this is too permissive
-    tmpfs = [
-        "/tmp",
-        "/home",
-        "/run/user",
-        "/run/media",
-    ]
-    tmpfs.extend(["/run/user/{UID}".format(**environ)]   if "UID"  in environ else [])
-    tmpfs.extend(["/run/media/{USER}".format(**environ)] if "USER" in environ else [])
 
-    def set_from_env(k, r, key=None):
-        if k in environ:
-            r[key or k] = environ[k]
+class ConfigMode(Enum):
+    expand = 'expand'
+    replace = 'replace'
 
-    env = {}
-    set_from_env("HOME", env)
-    set_from_env("TERM", env)
-    set_from_env("SHELL", env)
-    set_from_env("NIX_REMOTE", env)
 
-    if "NIX_REMOTE" not in env:
-        nix_local = [
-            environ.get("NIX_STORE_DIR", "/nix/store"),
-            environ.get("NIX_LOG_DIR",   "/nix/var/log/nix"),
-            environ.get("NIX_STATE_DIR", "/nix/var/nix"),
-        ]
-        rw.extend(list(filter(exists, nix_local)))
+class NoConfigFoundError(RuntimeError):
+    pass
 
-    args = {
-        "bwrap": [
-            "--die-with-parent",
-            "--unshare-ipc",
-            "--unshare-cgroup",
-            "--unshare-uts",
-            "--unshare-pid",
-            "--hostname", "localhost",
-            "--proc", "/proc",
-        ],
-        "nix-shell":  [],
-    }
-    set_from_env("SHELL", args, key="command")
 
-    return {
-        "mode": "expand",
-        "mounts": {
-            "rw": rw,                             # [(from, to), (from, to), ...] | [to, to, ...]
-            "ro": ro,                             # [(from, to), (from, to), ...] | [to, to, ...]
-            "dev": dev,                           # [(from, to), (from, to), ...] | [to, to, ...]
-            "tmpfs": list(filter(exists, tmpfs)), # [to, to, ...]
-        },
-        "environment": env,
-        "arguments": args
-    }
+@dataclass
+class BindDefinition:
+    path_to: str  # path inside sandbox
+    path_from: Optional[str] = None  # path in host
+    force_creation: bool = False  # force create host path if not exist
 
-def realpathwhich(v):
-    path = which(v)
-    if path:
-        return realpath(path)
-    return v
+    # optional: bool = False  # if True - non-existing host paths will be skipped  # TODO: add this flag
 
-def expand(v, ctx=environ):
-    return Template(expanduser(v)).substitute(defaultdict(str, ctx))
+    def path_pair(self) -> Tuple[str, str]:
+        """
+        returns pair of paths: host path FROM where to mount, and sandbox path where TO mount.
+        :return:
+        """
+        return self.path_from or self.path_to, self.path_to
 
-def split_path(v):
-    buf = ""
-    res = []
-    for c in v:
-        if c == sep:
-            if len(buf) > 0:
-                res.append(buf)
-                buf = ""
-            res.append(c)
+    def __str__(self):
+        return (
+            f'mount from "{self.path_from or self.path_to}" to "{self.path_to}", '
+            f'flags: {"mkdir" if self.force_creation else ""}'
+        )
+
+
+@dataclass
+class ConfigMounts:
+    rw: List[BindDefinition]
+    ro: List[BindDefinition]
+    dev: List[BindDefinition]
+    tmpfs: List[BindDefinition]
+
+    def merge(self, other: "ConfigMounts"):
+        self.rw.extend(other.rw)
+        self.ro.extend(other.ro)
+        self.dev.extend(other.dev)
+        self.tmpfs.extend(other.tmpfs)
+
+    def __str__(self):
+        linesep = '\n'
+        return ('MOUNTS:\n'
+                f'  RW   :\n{linesep.join([f"    {x}" for x in self.rw])}\n'
+                f'  RO   :\n{linesep.join([f"    {x}" for x in self.rw])}\n'
+                f'  DEV  :\n{linesep.join([f"    {x}" for x in self.rw])}\n'
+                f'  TMPFS:\n{linesep.join([f"    {x}" for x in self.rw])}')
+
+
+@dataclass
+class ConfigArguments:
+    bwrap: List[str]  # extra arguments for bwrap
+    command: Union[str, List[str]] = "bash"
+
+    def __str__(self):
+        command = self.command
+        if isinstance(command, str):
+            command = [command]
+        return ('ARGS:\n'
+                f'  bwrap: [{" ".join(repr(x) for x in self.bwrap)}]\n'
+                f'  command: [{" ".join([repr(x) for x in command])}]')
+
+
+@dataclass
+class Config:
+    mode: ConfigMode
+    mounts: ConfigMounts
+    environment: Dict[str, str]
+    arguments: ConfigArguments
+    sandbox_cwd: Optional[str]
+    # flags
+    x11: Optional[bool] = None
+    wayland: Optional[bool] = None
+    pulseaudio: Optional[bool] = None
+    dri: Optional[bool] = None
+
+    def __str__(self):
+        return ('CONFIG:\n'
+                f'  mode: {self.mode.value}\n'
+                f'  sandbox cwd: {self.sandbox_cwd}\n'
+                f'  flags:'
+                f' {"x11" if self.x11 else "no-x11"}'
+                f' {"wayland" if self.wayland else "no-wayland"}'
+                f' {"pulseaudio" if self.pulseaudio else "no-pulseaudio"}'
+                f' {"dri" if self.dri else "no-dri"}'
+                '\n'
+                f'{self.mounts}\n'
+                f'{self.arguments}\n'
+                'ENVIRONMENT:\n'
+                + '\n'.join(f'  {k}={v}' for k, v in self.environment.items()))
+
+    @classmethod
+    def get_default_config(cls) -> "Config":
+        rw = []
+        ro = [BindDefinition("/")]
+        dev = [BindDefinition("/dev")]  # TODO: this is too permissive
+        tmpfs = [BindDefinition(x) for x in (
+            "/tmp",
+            "/home",
+            "/run/user",
+            "/run/media",
+        )]
+        if uid := os.environ.get('UID'):
+            tmpfs.append(BindDefinition(f'/run/user/{uid}'))
+        if user := os.environ.get('USER'):
+            tmpfs.append(BindDefinition(f'/run/media/{user}'))
+
+        def set_from_env(k, r, key=None):
+            if k in os.environ:
+                r[key or k] = os.environ[k]
+
+        env = {}
+        set_from_env("HOME", env)
+        set_from_env("TERM", env)
+        set_from_env("SHELL", env)
+        set_from_env("NIX_REMOTE", env)
+
+        if "NIX_REMOTE" not in env:
+            rw.extend([BindDefinition(path) for path in (
+                os.environ.get("NIX_STORE_DIR", "/nix/store"),
+                os.environ.get("NIX_LOG_DIR", "/nix/var/log/nix"),
+                os.environ.get("NIX_STATE_DIR", "/nix/var/nix"),
+            ) if os.path.exists(path)])
+
+        args = ConfigArguments(
+            bwrap=[
+                "--die-with-parent",
+                "--unshare-ipc",
+                "--unshare-cgroup",
+                "--unshare-uts",
+                "--unshare-pid",
+                "--hostname", "localhost",
+                "--proc", "/proc",
+            ],
+        )
+        if 'SHELL' in os.environ:
+            args.command = os.environ['SHELL']
+
+        return Config(
+            mode=ConfigMode.expand,
+            mounts=ConfigMounts(
+                rw=rw,
+                ro=ro,
+                dev=dev,
+                tmpfs=[mnt for mnt in tmpfs if os.path.exists(mnt.path_to)],  # exist check cuz we ONLY provide full paths above, no expand needed
+            ),
+            environment=env,
+            arguments=args,
+            sandbox_cwd=os.getcwd(),
+        )
+
+    def merge(self, other: "Config"):
+        if self.mode == ConfigMode.expand:
+            self.mounts.merge(other.mounts)
+            self.arguments.bwrap.extend(other.arguments.bwrap)  # TODO: this should have some kind of a check
+            if other.arguments.command:
+                self.arguments.command = other.arguments.command
         else:
-            buf += c
-    if len(buf) > 0:
-        res.append(buf)
-    return res
+            self.mounts = other.mounts
+            self.arguments = other.arguments
+        self.environment.update(other.environment)  # conform to old behaviour - env is always updated
 
-def merge(source, destination, mode="expand"):
-    if not mode in set(["expand", "replace"]):
-        raise RuntimeError("unsupported mode {}, it could be expand or replace".format(mode))
-    for key, value in source.items():
-        if isinstance(value, dict):
-            node = destination.setdefault(key, {})
-            merge(value, node, mode=mode)
-        elif isinstance(value, list) and mode == "expand":
-            items = []
-            for v in value + destination.get(key, []):
-                if v not in items:
-                    items.append(v)
-            destination[key] = items
+        if other.sandbox_cwd:
+            self.sandbox_cwd = other.sandbox_cwd
+        # flags
+        flags = ('x11', 'pulseaudio', 'wayland', 'dri')
+        if self.mode == ConfigMode.replace:
+            for flag in flags:
+                if (other_flag := getattr(other, flag)) is not None:
+                    setattr(self, flag, other_flag)
         else:
-            destination[key] = value
-    return destination
+            for flag in flags:
+                my_flag = getattr(self, flag)
+                if my_flag is None:  # meaning - not defined
+                    setattr(self, flag, getattr(other, flag))
+                else:
+                    setattr(self, flag, my_flag and getattr(other, flag))
 
-def get_user(user):
-    p = getpwnam(user)
-    return {
-        "user": p.pw_name,
-        "uid": p.pw_uid,
-        "gid": p.pw_gid
-    }
 
-def json_marshal_pretty_str(v):
-    return json_marshal_str(v, indent=4)
-
-def split_mount_suffix(v):
+def split_mount_suffix(path_with_suffix_maybe) -> Tuple[str, Optional[str]]:
+    mount_suffixes = (
+        "ro",
+        "rw",
+        "dev",
+        "tmpfs"
+    )
     for suffix in mount_suffixes:
-        delimited = ":" + suffix
-        if v.endswith(delimited):
+        delimited = f':{suffix}'
+        if path_with_suffix_maybe.endswith(delimited):
             return (
-                v[:-len(delimited)],
+                path_with_suffix_maybe[:-len(delimited)],
                 suffix,
             )
-    return (v, None)
+    return path_with_suffix_maybe, None
 
-def sorted_mounts(mounts):
-    ms = []
-    for k, v in mounts.items():
-        for mount in v:
-            ms.append((k, mount,))
 
-    ws = {}
-    for k1, p1 in enumerate(ms):
-        w = []
+def _mounts_to_bwrap_flags(mounts: ConfigMounts, sandbox_cwd: str) -> List[str]:
+    if not os.path.isabs(sandbox_cwd):
+        raise RuntimeError('sandbox_cwd MUST be absolute')
+    bind_flag_parts = []
 
-        for k2, p2 in enumerate(ms):
-            if k1 == k2:
-                continue
+    for bw_flag, mounts_list in (
+        ('--ro-bind', mounts.ro),
+        ('--bind', mounts.rw),
+        ('--dev-bind', mounts.dev),
+    ):
+        for mount in mounts_list:
+            bind_flag_parts.append(
+                (
+                    bw_flag,
+                    os.path.abspath(mount.path_from or mount.path_to),
+                    mount.path_to if os.path.isabs(mount.path_to) else os.path.join(sandbox_cwd, mount.path_to)
+                 )
+            )
 
-            p1s = split_path(p1[1][1])
-            p2s = split_path(p2[1][1])
-            n = 0
-
-            for v in p2s:
-                if len(p1s) <= n or len(p2s) <= n:
-                    break
-                if v == p1s[n]:
-                    n += 1
-                else:
-                    break
-
-            if len(p1s) > len(p2s):
-                n += 1
-
-            w.append(n)
-
-        ws[p1] = max(w)
-
-    return map(
-        lambda v: v[1],
-        sorted(
-            [(v, k,) for k, v in ws.items()],
-            key=lambda v: v[0]
+    for mount in mounts.tmpfs:
+        bind_flag_parts.append(
+            ('--tmpfs', mount.path_to if os.path.isabs(mount.path_to) else os.path.join(sandbox_cwd, mount.path_to))
         )
+
+    # sort so that bind order is from root
+    return [
+        x
+        for y in sorted(bind_flag_parts, key=lambda arg_tuple: len(arg_tuple[-1].split(os.sep)))
+        for x in y
+    ]
+
+
+_expand_re = re.compile(r'\$(?:(\w+)|\{(\w+)})|(~)')
+def expand_vars(text: str, env: Dict[str, str], *, home: str = '~') -> str:
+    """
+    expands variables in text with given kvp dict env
+    :param text:
+    :param env:
+    :param home: what ~ expands to. no expand by default (since val is the same ~)
+    :return:
+    """
+    return _expand_re.sub(lambda m: (env.get(m.group(1) or m.group(2), '') if m.group(3) != '~' else home), text)
+
+
+def make_command(config: Config) -> Tuple[str, List[str]]:
+    """
+    returns abs path to bwrap command
+    and the whole list of args to run it (including the 0 arg, the bwrap command)
+
+    :param config:
+    :return:
+    """
+    bwrap_command = os.path.realpath(which("bwrap"))
+
+    # first, expand environment vars
+    bwrap_env = copy(config.environment)
+    base_env = dict(os.environ)
+    expanded_something = True
+    while expanded_something:
+        # Note, if there are loops in env dependency graph - this will go infinite
+        expanded_something = False
+        for key, val in bwrap_env.items():
+            expanded_val = expand_vars(val, base_env | bwrap_env)
+            if expanded_val != val:
+                expanded_something = True
+                bwrap_env[key] = expanded_val
+
+    # calc final sandbox_cwd
+    host_home = os.path.expanduser('~')
+    sandbox_home = (base_env | bwrap_env).get('HOME', os.path.expanduser('~'))
+    sandbox_cwd_expanded = expand_vars(
+        config.sandbox_cwd,
+        base_env | bwrap_env,
+        home=sandbox_home,
     )
 
-def make_command(config):
-    command = realpathwhich("bwrap")
-    mounts = list(reduce(lambda acc, v: acc + v,
-                         map(lambda v: (
-                             ["--ro-bind"] + list(v[1][:2]) if v[0] == "ro"
-                             else ["--bind"] + list(v[1][:2]) if v[0] == "rw"
-                             else ["--dev-bind"] + list(v[1][:2]) if v[0] == "dev"
-                             else ["--tmpfs", v[1][1]] if v[0] == "tmpfs"
-                             else []
-                         ), sorted_mounts(config["mounts"])), []))
+    if not os.path.isabs(sandbox_cwd_expanded):
+        raise RuntimeError('failed to make sandbox cwd into an absolute path')
 
-    env = list(reduce(lambda acc, kv: acc + ["--setenv"] + list(kv),
-                      config["environment"].items(), []))
+    # create final mount config
+    mount_config = copy(config.mounts)
+    if config.x11:
+        if xauth_path := os.environ.get('XAUTHORITY'):
+            mount_config.ro.append(BindDefinition(xauth_path))
+        mount_config.rw.append(BindDefinition('/tmp/.X11-unix'))
+    if config.pulseaudio:
+        mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/pulse'))
+    if config.wayland:
+        mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/wayland-0'))
+    if not config.dri:
+        # by default, the whole /dev is binded, so this we unbind
+        mount_config.tmpfs.append(BindDefinition('/dev/dri'))
 
-    bwrap_flags = config["arguments"]["bwrap"]
-    if run := config["arguments"].get("run"):  # expected to be a list to exec
-        run_args = run
-    elif exists("shell.nix"):  # this check should happen at runtime, since bwrap may rebind stuff around and cd
-        run_args = \
-            [which("nix-shell")] + \
-            config["arguments"]["nix-shell"] + \
-            ["--command", config["arguments"]["command"]]
-    else:
-        run_command = config["arguments"]["command"]
-        if run_command:
-            run_args = shlex.split(run_command)
-        else:
-            run_args = [which(environ.get("SHELL", "bash"))]
+    # mount args for bwrap
 
-    return command, [basename(command)] + mounts + env + bwrap_flags + run_args
+    for mount in mount_config.rw + mount_config.ro + mount_config.dev:
+        mount.path_from = expand_vars(mount.path_from or mount.path_to, bwrap_env, home=host_home)
+        mount.path_to = expand_vars(mount.path_to, base_env | bwrap_env, home=sandbox_home)
+    for mount in mount_config.tmpfs:
+        mount.path_from = None
+        mount.path_to = expand_vars(mount.path_to, base_env | bwrap_env, home=sandbox_home)
 
-def load_config(config, arguments, rest):
-    files = []
-    filepath = abspath(arguments["config"])
-    # we take config given at filepath
-    #  and all the ones with the same name in parent dirs, if found
-    while True:
-        if exists(filepath):
-            files.insert(0, filepath)
-        dir, name = splitfile(filepath)
-        next_filepath = normalizepath(joinpath(dirname(dir), name))
-        if next_filepath != filepath:
-            filepath = next_filepath
-        else:
-            break
-
-    for filepath in files:
-        with open(filepath, "r") as stream:
-            overlay_config = json_unmarshal(stream)
-            global_mode = overlay_config.get("mode", config["mode"])
-            for section in ["mounts", "environment", "arguments", "flags"]:
-                overlay_mode = overlay_config.get("mode", global_mode)
-                overlay_section_mode = overlay_config.get(section, {}).get("mode", overlay_mode)
-                config[section] = merge(
-                    overlay_config.get(section, {}),
-                    config.get(section, {}),
-                    mode=overlay_section_mode
-                )
-
-    ##
-
-    if arguments["command"]:
-        config["arguments"]["command"] = arguments["command"]
-    config["arguments"]["bwrap"] += rest
-    for path in arguments["path"]:
-        path, suffix = split_mount_suffix(path)
-        if not suffix:
-            suffix = "rw"
-        if suffix == "tmpfs":
-            config["mounts"][suffix].append(path)
-        else:
-            config["mounts"][suffix].append((path, path,))
+    bwrap_mounts = _mounts_to_bwrap_flags(mount_config, sandbox_cwd=sandbox_cwd_expanded)
 
     # extra mounts based on common mount flags
-    # first make a set of all flags that are true in config
-    flags = set(k for k, v in config.get("flags", {}).get("set", {}).items() if v)
-    # then add some added from arguments
-    flags.update({k for k, v in arguments.items() if k in {"x11", "pulseaudio", "wayland"} and v})
-    if "x11" in flags:
-        if xauth_path := environ.get('XAUTHORITY'):
-            config["mounts"]["ro"] += [xauth_path]
-        config["mounts"]["rw"] += ["/tmp/.X11-unix"]
-    if "pulseaudio" in flags:
-        config["mounts"]["ro"] += ["/run/user/{UID}/pulse".format(**environ)]
-    if "wayland" in flags:
-        config["mounts"]["ro"] += ["/run/user/{UID}/wayland-0".format(**environ)]
 
-    ##
+    # env args for bwrap
+    bwrap_env_args = [
+        x
+        for env_name, env_val in bwrap_env.items()  # env is already expanded here
+        for x in ['--setenv', env_name, env_val]
+    ]
 
-    expand_mount = lambda v: (abspath(expand(v[0])), abspath(expand(v[1])),) + tuple(v[2:])
-    for k, v in config["mounts"].items():
-        config["mounts"][k] = [
-            expand_mount((v, v,) if type(v) is str else v)
-            for v in config["mounts"][k]
-        ]
-    for k, v in config["environment"].items():
-        config["environment"][k] = expand(v)
+    bwrap_chdir = ['--chdir', sandbox_cwd_expanded]
+
+    bwrap_flags = config.arguments.bwrap
+    if run := config.arguments.command:
+        if isinstance(run, str):
+            run = [run]
+        run_args = run
+    # elif os.exists("shell.nix"):  # TODO: this check should happen at runtime, since bwrap may rebind stuff around and cd
+    #     run_args = \
+    #         [which("nix-shell")] + \
+    #         config["arguments"]["nix-shell"] + \
+    #         ["--command", config["arguments"]["command"]]
+    else:
+        raise RuntimeError('command to run was not provided')
+
+    return (
+        bwrap_command,
+        [os.path.basename(bwrap_command)] + bwrap_mounts + bwrap_env_args + bwrap_chdir + bwrap_flags + run_args
+    )
+
+
+def deserialize_config(text: str) -> Config:
+    default_config = Config.get_default_config()
+
+    data = json.loads(text)
+
+    mounts = ConfigMounts([], [], [], [])
+    if mounts_data := data.get('mounts'):
+        rws = []
+        ros = []
+        devs = []
+        tmpfses = []
+
+        for mounts_list, mount_key in (
+            (rws, 'rw'),
+            (ros, 'ro'),
+            (devs, 'dev'),
+        ):
+            for param_list in mounts_data.get(mount_key, []):
+                if len(param_list) <= 2:
+                    # for len == 1 treat single entry as both from and to
+                    mounts_list.append(BindDefinition(param_list[-1], param_list[0]))
+                else:  # remaining elements treated as flags/options
+                    if len(param_list) == 3:  # proper way of specifying flags
+                        flags = param_list[2]  # this is expected to be a dict of flags/options and values
+                        if not isinstance(flags, dict):
+                            raise RuntimeError('mount flags are not a dict')
+                    else:
+                        flags = {}
+                        legacy_flags = set(param_list[2:])  # for compatibility
+                        if 'd' in legacy_flags:
+                            flags['force_creation'] = True
+                    mounts_list.append(BindDefinition(param_list[1], param_list[0], **flags))
+        for path in mounts_data.get('tmpfs', []):
+            tmpfses.append(BindDefinition(path))
+
+        mounts = ConfigMounts(
+            rw=rws,
+            ro=ros,
+            dev=devs,
+            tmpfs=tmpfses,
+        )
+
+    env = {}
+    if env_data := data.get('environment'):
+        for key, val in env_data.items():
+            env[str(key)] = str(val)
+
+    args = ConfigArguments([], '')
+    if args_data := data.get('arguments'):
+        if args_data_command := args_data.get('run', args_data.get('command')):  # command and run mean the same
+            args.command = args_data_command
+        if args_data_bwrap := args_data.get('bwrap'):
+            args.bwrap = args_data_bwrap
+
+    return Config(
+        mode=ConfigMode(data['mode']) if 'mode' in data else ConfigMode.expand,
+        mounts=mounts,
+        environment=env,
+        arguments=args,
+        sandbox_cwd=data.get('sandbox-cwd', default_config.sandbox_cwd),
+        x11=data.get('x11', data.get('flags', {}).get('x11', False)),  # these flags.set. - is for some backwards compat
+        pulseaudio=data.get('pulseaudio', data.get('flags', {}).get('set', {}).get('pulseaudio', False)),
+        wayland=data.get('wayland', data.get('flags', {}).get('set', {}).get('wayland', False)),
+    )
+
+
+def load_config(file_path: Path) -> Config:
+    # recursively scan for configs with same name in parent locations
+    config_paths = []
+    for base_path in file_path.parents:
+        config_path = base_path / file_path.name
+        if not config_path.exists():
+            continue
+        config_paths.insert(0, config_path)
+
+    if len(config_paths) == 0:
+        raise NoConfigFoundError('no configs to load')
+
+    # and load them from eldest to youngest
+    config = Config.get_default_config()
+    for file_path in config_paths:
+        with open(file_path, 'r') as f:
+            more_config = deserialize_config(f.read())
+            config.merge(more_config)
 
     return config
 
-def ensure_prerequisites(config):
-    initializers = {
-        "d": lambda item: makedirs(item[0], exist_ok=True),
-    }
 
-    for k, v in config["mounts"].items():
-        for item in v:
-            if len(item) == 3:
-                init = initializers.get(item[2], False)
-                if init:
-                    init(item)
+def ensure_prerequisites(config: Config):
+    """
+    before sandbox is run there may be some things that
+    need to be done on the host, such as certain paths may be
+    required to exist by the config.
+    This function does that
 
-def main(arguments, rest=[]):
-    user = get_user(environ["USER"])
-    environ["UID"] = str(user["uid"])
-    environ["GID"] = str(user["gid"])
+    :param config:
+    :return:
+    """
+    for mount in config.mounts.rw + config.mounts.ro + config.mounts.dev:
+        if mount.force_creation and not os.path.exists(path := (mount.path_from or mount.path_to)):
+            os.makedirs(path, exist_ok=True)
 
-    arguments["cd"] = abspath(expanduser(arguments["cd"]))
-    chdir(arguments["cd"])
 
-    config = load_config(get_default_config(), arguments, rest)
+def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False) -> Config:
+    """
+    generate the default config to apply when nix-cage is run in a directory
+    :return:
+    """
+    cwd = Path(os.getcwd())
+    persistent_home_dirname = 'nixcage_home'
+    host_new_home = cwd / persistent_home_dirname
+    if host_new_home.exists():
+        mounts = ConfigMounts(
+            rw=[
+                BindDefinition(
+                    path_from=str(host_new_home),
+                    path_to='~',
+                ),
+                BindDefinition(
+                    path_from='.',
+                    path_to='~/workspace',
+                )
+            ],
+            ro=[],
+            dev=[],
+            tmpfs=[BindDefinition(f'~/workspace/{persistent_home_dirname}')],  # to avoid confusing cyclic bind
+        )
+    else:
+        mounts = ConfigMounts(
+            rw=[BindDefinition(
+                path_from='.',
+                path_to='~/workspace',
+            )],
+            ro=[],
+            dev=[],
+            tmpfs=[BindDefinition('~')],
+        )
 
-    if arguments["show_config"]:
-        print(json_marshal_pretty_str(config))
-        return
+    config = Config.get_default_config()
+    config.merge(Config(
+        mode=ConfigMode.expand,
+        mounts=mounts,
+        environment={},
+        arguments=ConfigArguments(
+            bwrap=[],
+            command='',
+        ),
+        sandbox_cwd='~/workspace',
+    ))
 
-    ensure_prerequisites(config)
+    if not minimal:
+        # some most basic quality of life things
+        config.mounts.ro.extend([
+            BindDefinition(
+                path_from='~/.nix-profile',
+                path_to='~/.nix-profile'),
+            BindDefinition(
+                path_from='~/.bashrc',
+                path_to='~/.bashrc'),
+        ])
+        if bind_gtk:
+            for path in (
+                '~/.config/gtk-2.0',
+                '~/.config/gtk-3.0',
+                '~/.config/gtk-4.0',
+                '~/.config/gtkrc',
+                '~/.config/gtkrc-2.0',
+            ):
+                if not os.path.exists(os.path.expanduser(path)):
+                    continue
+                config.mounts.ro.append(
+                    BindDefinition(
+                        path_from=path,
+                        path_to=path),
+                )
+    return config
 
-    command, flags = make_command(config)
-    stderr.write(" ".join(flags) + "\n")
-    execve(command, flags, environ)
 
-if __name__ == "__main__":
+def main(argv: List[str]):
     p = ArgumentParser(
-        description="Nix-cage, sandboxed environments with nix-shell"
+        prog='nix-cage',
+        description=
+        'Nix-cage, very simple sandboxed environments.\n\n'
+        'sandbox configuration is defined either by hierarchical scan for given config file, '
+        'or by default config.\n'
+        'If run in a directory with no config argument and no nix-cage.json config file anywhere '
+        'up the dir hierarchy - then current dir is binded to ~/workspace inside the sandbox, '
+        'where ~ is a tmpfs.\n'
+        'If you want to preserve that home - create "nixcage_home" dir in the dir where you run nix-cage, '
+        'and that nixcage_home will be binded to ~ in sandbox instead of tmpfs\n\n'
+        'all arguments after -- are treated as command line to run in sandbox',
+        formatter_class=RawDescriptionHelpFormatter,
     )
 
     p.add_argument(
@@ -323,18 +550,98 @@ if __name__ == "__main__":
             "One or more directories or files which will be mounted into the sandbox. "
             "Paths inside sandbox are same as in host system. "
             "Mounts are read/write by default, but you could change this by appending one "
-            "of {} suffixes to the path.".format(
-                "|".join([":" + v for v in mount_suffixes])
-            )
+            "of :ro :rw :tmpfs suffixes to the path."
         )
     )
-    p.add_argument("--config", help="config file path", default="nix-cage.json")
+    p.add_argument("--config", help="config file path")
     p.add_argument("--command", help="command to execute inside the sandbox")
     p.add_argument("--show-config", help="dumps config in JSON and exit", action="store_true")
-    p.add_argument("--cd", "-C", help="change to directory before doing anything", default=getcwd())
-    p.add_argument("--x11", help="bind some stuff to enable x11", action="store_true")
-    p.add_argument("--pulseaudio", help="bind some stuff to enable pulseaudio", action="store_true")
-    p.add_argument("--wayland", help="bind some stuff to enable wayland", action="store_true")
+    p.add_argument("--verbose", help="print too much information", action="store_true")
+    p.add_argument("--cd", "-C", help="change to directory before doing anything", default=os.getcwd())
+    p.add_argument("--x11", help="bind some stuff to enable x11", action=BooleanOptionalAction)
+    p.add_argument("--pulseaudio", help="bind some stuff to enable pulseaudio", action=BooleanOptionalAction)
+    p.add_argument("--wayland", help="bind some stuff to enable wayland", action=BooleanOptionalAction)
+    p.add_argument("--dri", help="bind /dev/dri", action=BooleanOptionalAction)
 
-    arguments, rest = p.parse_known_args()
-    main(arguments.__dict__, rest)
+    command_args = []
+    if '--' in argv:
+        sep_i = argv.index('--')
+        command_args = argv[sep_i + 1:]
+        argv = argv[:sep_i]
+    arguments = p.parse_args(argv)
+
+    user = getpwnam(os.environ["USER"])
+    os.environ["UID"] = str(user.pw_uid)
+    os.environ["GID"] = str(user.pw_gid)
+
+    arguments.cd = os.path.abspath(os.path.expanduser(arguments.cd))
+    if not os.path.exists(arguments.cd):
+        raise RuntimeError(f'provided cwd does not exist: "{arguments.cd}"')
+    os.chdir(arguments.cd)
+
+    # select and load config
+    if arguments.config is None:
+        # try to locate config in cwd or above
+        try:
+            config = load_config(Path('nix-cage.json'))
+        except NoConfigFoundError:
+            config = None
+        if config is None and command_args:
+            # default behaviour when called without config present at all
+            # bind gtk config only if something about graphics was requested
+            config = get_noconfig_config(bind_gtk=arguments.x11 or arguments.wayland)
+    else:
+        # if config was explicitly provided - no config found is a critical error
+        config = load_config(Path(arguments.config))
+
+    if config is None:
+        raise RuntimeError('no config to run nix-cage')
+
+    #
+    # override config
+    #
+    if arguments.command or command_args:
+        config.arguments.command = [x for x in ' '.split(arguments.command) if x] + command_args
+    # mount paths
+    for path_with_suffix_maybe in arguments.path:
+        path, suffix = split_mount_suffix(path_with_suffix_maybe)
+        if not suffix:
+            suffix = "ro"
+        if suffix == "tmpfs":
+            config.mounts.tmpfs.append(BindDefinition(path))
+        elif suffix == 'ro':
+            config.mounts.ro.append(BindDefinition(path))
+        elif suffix == 'rw':
+            config.mounts.rw.append(BindDefinition(path))
+        else:
+            raise RuntimeError(f'unknown suffix in mount path "{suffix}"')
+    # flags
+    if arguments.x11 is not None:
+        config.x11 = arguments.x11
+    if arguments.pulseaudio is not None:
+        config.pulseaudio = arguments.pulseaudio
+    if arguments.wayland is not None:
+        config.wayland = arguments.wayland
+    if arguments.dri is not None:
+        config.dri = arguments.dri
+    #
+    if arguments.verbose:
+        print(config, file=sys.stderr)
+
+    if arguments.show_config:
+        print('config after overrides from args:')
+        print(config)
+        return
+
+    ensure_prerequisites(config)
+    command, args = make_command(config)
+
+    if arguments.verbose:
+        print(f'about to exec "{command}"', file=sys.stderr)
+        print(f'args: {shlex.join(args)}', file=sys.stderr)
+    print('entering the sandbox', file=sys.stderr)
+    os.execve(command, args, os.environ)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
