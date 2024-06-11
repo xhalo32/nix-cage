@@ -349,6 +349,47 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
     )
 
 
+def serialize_config(config: Config) -> str:
+    """
+    serializes config into json file
+    TODO: NEED TESTS !!!
+    :param config:
+    :return:
+    """
+    data: dict = {}
+    # arguments
+    data['arguments'] = {
+        'run': config.arguments.command,
+        'bwrap': config.arguments.bwrap,
+    }
+    # flags
+    for name in ('x11', 'wayland', 'pulseaudio', 'dri'):
+        flag = getattr(config, name)
+        if flag is None:  # not set
+            continue
+        data.setdefault('flags', {})[name] = flag
+    # mounts
+    for name in ('rw', 'ro', 'dev'):
+        for mount in getattr(config.mounts, name):
+            bfrom = mount.path_from or mount.path_to
+            bto = mount.path_to
+            bforce_creation = mount.force_creation
+            if bfrom is None and not bforce_creation:
+                mount_data = [bto]
+            elif bforce_creation:  # any flag set
+                mount_data = [bfrom, bto, {'force_creation': bforce_creation}]
+            else:
+                mount_data = [bfrom, bto]
+            data.setdefault('mounts', {}).setdefault(name, []).append(mount_data)
+    for mount in config.mounts.tmpfs:
+        data.setdefault('mounts', {}).setdefault('tmpfs', []).append(mount.path_to)
+    #
+    if config.sandbox_cwd:
+        data['sandbox-cwd'] = config.sandbox_cwd
+
+    return json.dumps(data, indent=4)
+
+
 def deserialize_config(text: str) -> Config:
     default_config = Config.get_default_config()
 
