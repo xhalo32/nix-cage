@@ -111,6 +111,23 @@ class Config:
                 + '\n'.join(f'  {k}={v}' for k, v in self.environment.items()))
 
     @classmethod
+    def get_empty_config(cls) -> "Config":
+        return Config(
+            mode=ConfigMode.expand,
+            mounts=ConfigMounts(
+                rw=[],
+                ro=[],
+                dev=[],
+                tmpfs=[],
+            ),
+            environment={},
+            arguments=ConfigArguments(
+                bwrap=[],
+            ),
+            sandbox_cwd=None,
+        )
+        
+    @classmethod
     def get_default_config(cls) -> "Config":
         rw = []
         ro = [BindDefinition("/")]
@@ -453,6 +470,7 @@ def deserialize_config(text: str) -> Config:
         x11=data.get('x11', data.get('flags', {}).get('x11', False)),  # these flags.set. - is for some backwards compat
         pulseaudio=data.get('pulseaudio', data.get('flags', {}).get('set', {}).get('pulseaudio', False)),
         wayland=data.get('wayland', data.get('flags', {}).get('set', {}).get('wayland', False)),
+        dri=data.get('dri', data.get('flags', {}).get('set', {}).get('dri', False)),
     )
 
 
@@ -493,14 +511,13 @@ def ensure_prerequisites(config: Config):
             os.makedirs(path, exist_ok=True)
 
 
-def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False) -> Config:
+def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False, merge_default: bool = True) -> Config:
     """
     generate the default config to apply when nix-cage is run in a directory
     :return:
     """
-    cwd = Path(os.getcwd())
     persistent_home_dirname = 'nixcage_home'
-    host_new_home = cwd / persistent_home_dirname
+    host_new_home = Path('.') / persistent_home_dirname
     if host_new_home.exists():
         mounts = ConfigMounts(
             rw=[
@@ -528,7 +545,10 @@ def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False) -> Config
             tmpfs=[BindDefinition('~')],
         )
 
-    config = Config.get_default_config()
+    if merge_default:
+        config = Config.get_default_config()
+    else:
+        config = Config.get_empty_config()
     config.merge(Config(
         mode=ConfigMode.expand,
         mounts=mounts,
@@ -568,6 +588,33 @@ def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False) -> Config
     return config
 
 
+def override_config_with_arguments(config, arguments, command_args):
+    if arguments.command or command_args:
+        config.arguments.command = [x for x in ' '.split(arguments.command) if x] + command_args
+    # mount paths
+    for path_with_suffix_maybe in arguments.path:
+        path, suffix = split_mount_suffix(path_with_suffix_maybe)
+        if not suffix:
+            suffix = "ro"
+        if suffix == "tmpfs":
+            config.mounts.tmpfs.append(BindDefinition(path))
+        elif suffix == 'ro':
+            config.mounts.ro.append(BindDefinition(path))
+        elif suffix == 'rw':
+            config.mounts.rw.append(BindDefinition(path))
+        else:
+            raise RuntimeError(f'unknown suffix in mount path "{suffix}"')
+    # flags
+    if arguments.x11 is not None:
+        config.x11 = arguments.x11
+    if arguments.pulseaudio is not None:
+        config.pulseaudio = arguments.pulseaudio
+    if arguments.wayland is not None:
+        config.wayland = arguments.wayland
+    if arguments.dri is not None:
+        config.dri = arguments.dri
+
+
 def main(argv: List[str]):
     p = ArgumentParser(
         prog='nix-cage',
@@ -596,7 +643,8 @@ def main(argv: List[str]):
     )
     p.add_argument("--config", help="config file path")
     p.add_argument("--command", help="command to execute inside the sandbox")
-    p.add_argument("--show-config", help="dumps config in JSON and exit", action="store_true")
+    p.add_argument("--show-config", help="dumps config in readable form and exit", action="store_true")
+    p.add_argument("--write-default-config", help="saves default config into nix-cage.json and exit", action="store_true")
     p.add_argument("--verbose", help="print too much information", action="store_true")
     p.add_argument("--cd", "-C", help="change to directory before doing anything", default=os.getcwd())
     p.add_argument("--x11", help="bind some stuff to enable x11", action=BooleanOptionalAction)
@@ -636,35 +684,12 @@ def main(argv: List[str]):
         config = load_config(Path(arguments.config))
 
     if config is None:
-        raise RuntimeError('no config to run nix-cage')
+        raise RuntimeError('no config to run nix-cage. provide a binary to run to use default minimal config')
 
     #
     # override config
     #
-    if arguments.command or command_args:
-        config.arguments.command = [x for x in ' '.split(arguments.command) if x] + command_args
-    # mount paths
-    for path_with_suffix_maybe in arguments.path:
-        path, suffix = split_mount_suffix(path_with_suffix_maybe)
-        if not suffix:
-            suffix = "ro"
-        if suffix == "tmpfs":
-            config.mounts.tmpfs.append(BindDefinition(path))
-        elif suffix == 'ro':
-            config.mounts.ro.append(BindDefinition(path))
-        elif suffix == 'rw':
-            config.mounts.rw.append(BindDefinition(path))
-        else:
-            raise RuntimeError(f'unknown suffix in mount path "{suffix}"')
-    # flags
-    if arguments.x11 is not None:
-        config.x11 = arguments.x11
-    if arguments.pulseaudio is not None:
-        config.pulseaudio = arguments.pulseaudio
-    if arguments.wayland is not None:
-        config.wayland = arguments.wayland
-    if arguments.dri is not None:
-        config.dri = arguments.dri
+    override_config_with_arguments(config, arguments, command_args)
     #
     if arguments.verbose:
         print(config, file=sys.stderr)
@@ -672,6 +697,15 @@ def main(argv: List[str]):
     if arguments.show_config:
         print('config after overrides from args:')
         print(config)
+        return
+    if arguments.write_default_config:
+        config = get_noconfig_config(bind_gtk=arguments.x11 or arguments.wayland, merge_default=False)
+        override_config_with_arguments(config, arguments, command_args)
+
+        config_path = Path(arguments.config or 'nix-cage.json')
+        print(f'writing config to {config_path}')
+        with open(config_path, 'w') as f:
+            f.write(serialize_config(config))
         return
 
     ensure_prerequisites(config)
