@@ -384,7 +384,7 @@ def serialize_config(config: Config) -> str:
         flag = getattr(config, name)
         if flag is None:  # not set
             continue
-        data.setdefault('flags', {})[name] = flag
+        data[name] = flag
     # mounts
     for name in ('rw', 'ro', 'dev'):
         for mount in getattr(config.mounts, name):
