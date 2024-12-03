@@ -29,6 +29,7 @@ class BindDefinition:
     path_to: str  # path inside sandbox
     path_from: Optional[str] = None  # path in host
     force_creation: bool = False  # force create host path if not exist
+    permissions_octal: Optional[int] = None
 
     # optional: bool = False  # if True - non-existing host paths will be skipped  # TODO: add this flag
 
@@ -130,18 +131,22 @@ class Config:
     @classmethod
     def get_default_config(cls) -> "Config":
         rw = []
-        ro = [BindDefinition("/")]
+        ro = [
+            BindDefinition("/"),
+            BindDefinition("/run/current-system/sw"),
+        ]
         dev = [BindDefinition("/dev")]  # TODO: this is too permissive
         tmpfs = [BindDefinition(x) for x in (
             "/tmp",
             "/home",
+            "/run",
             "/run/user",
             "/run/media",
         )]
         if uid := os.environ.get('UID'):
-            tmpfs.append(BindDefinition(f'/run/user/{uid}'))
+            tmpfs.append(BindDefinition(f'/run/user/{uid}, permissions_octal=0o700'))
         if user := os.environ.get('USER'):
-            tmpfs.append(BindDefinition(f'/run/media/{user}'))
+            tmpfs.append(BindDefinition(f'/run/media/{user}, permissions_octal=0o700'))
 
         def set_from_env(k, r, key=None):
             if k in os.environ:
@@ -244,6 +249,7 @@ def _mounts_to_bwrap_flags(mounts: ConfigMounts, sandbox_cwd: str) -> List[str]:
     ):
         for mount in mounts_list:
             bind_flag_parts.append(
+                (( '--perms', f'0{mount.premissions_octal:o}') if mount.permissions_octal is not None else ()) + \
                 (
                     bw_flag,
                     os.path.abspath(mount.path_from or mount.path_to),
@@ -253,6 +259,7 @@ def _mounts_to_bwrap_flags(mounts: ConfigMounts, sandbox_cwd: str) -> List[str]:
 
     for mount in mounts.tmpfs:
         bind_flag_parts.append(
+            (( '--perms', f'0{mount.premissions_octal:o}') if mount.permissions_octal is not None else ()) + \
             ('--tmpfs', mount.path_to if os.path.isabs(mount.path_to) else os.path.join(sandbox_cwd, mount.path_to))
         )
 
@@ -321,7 +328,9 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
         mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/pulse'))
     if config.wayland:
         mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/wayland-0'))
-    if not config.dri:
+    if config.dri:
+        mount_config.ro.append(BindDefinition("/run/opengl-driver"))
+    else:
         # by default, the whole /dev is binded, so this we unbind
         mount_config.tmpfs.append(BindDefinition('/dev/dri'))
 
