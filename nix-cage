@@ -147,6 +147,8 @@ class Config:
             tmpfs.append(BindDefinition(f'/run/user/{uid}, permissions_octal=0o700'))
         if user := os.environ.get('USER'):
             tmpfs.append(BindDefinition(f'/run/media/{user}, permissions_octal=0o700'))
+        if os.path.islink('/etc/resolv.conf'):  # systemd-resolve links this
+            ro.append(BindDefinition(os.path.realpath('/etc/resolv.conf')))
 
         def set_from_env(k, r, key=None):
             if k in os.environ:
