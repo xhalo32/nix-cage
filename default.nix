@@ -5,6 +5,8 @@
   python311,
   bubblewrap,
   nix,
+  writeText,
+  cage-config ? null,
 }:
 stdenv.mkDerivation rec {
   name = "nix-cage";
@@ -16,6 +18,10 @@ stdenv.mkDerivation rec {
     patchShebangs .
   '';
 
+  extraWrapArgs = [] ++
+    (if isNull cage-config then [] else [''--add-flags "--config ${writeText "nix-cage-config.json" (builtins.toJSON cage-config)}"'']);
+      
+
   installPhase = ''
     source $stdenv/setup
     set -e
@@ -24,10 +30,12 @@ stdenv.mkDerivation rec {
     cp       $src/${name} $out/bin
     chmod +x $out/bin/${name}
 
-    wrapProgram $out/bin/${name} --prefix PATH : ${lib.makeBinPath [
-      bubblewrap
-      nix
-    ]}
+    wrapProgram $out/bin/${name} \
+      ${builtins.concatStringsSep " " extraWrapArgs} \
+      --prefix PATH : ${lib.makeBinPath [
+        bubblewrap
+        nix
+      ]}
   '';
 
   meta = {
