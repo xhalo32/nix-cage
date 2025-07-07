@@ -31,11 +31,11 @@ stdenv.mkDerivation rec {
   '';
 
   meta = {
-    homepage = https://github.com/corpix/nix-cage;
+    homepage = "https://github.com/pedohorse/nix-cage";
     description = "Sandboxed environments with nix-shell";
 
     longDescription = ''
-      Sandboxed environments with bwrap and nix-shell
+      Sandboxed environments with bwrap
     '';
 
     license = lib.licenses.mit;
