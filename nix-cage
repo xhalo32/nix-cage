@@ -90,6 +90,7 @@ class Config:
     environment: Dict[str, str]
     arguments: ConfigArguments
     sandbox_cwd: Optional[str]
+    hostname: Optional[str] = 'localhost'
     # flags
     x11: Optional[bool] = None
     wayland: Optional[bool] = None
@@ -100,6 +101,7 @@ class Config:
         return ('CONFIG:\n'
                 f'  mode: {self.mode.value}\n'
                 f'  sandbox cwd: {self.sandbox_cwd}\n'
+                f'  hostname: {self.hostname}\n'
                 f'  flags:'
                 f' {"x11" if self.x11 else "no-x11"}'
                 f' {"wayland" if self.wayland else "no-wayland"}'
@@ -174,7 +176,6 @@ class Config:
                 "--unshare-cgroup",
                 "--unshare-uts",
                 "--unshare-pid",
-                "--hostname", "localhost",
                 "--proc", "/proc",
             ],
         )
@@ -205,8 +206,9 @@ class Config:
             self.arguments = other.arguments
         self.environment.update(other.environment)  # conform to old behaviour - env is always updated
 
-        if other.sandbox_cwd:
-            self.sandbox_cwd = other.sandbox_cwd
+        for option in ('sandbox_cwd', 'hostname'):
+            if (val := getattr(other, option)) is not None:
+                setattr(self, option, val)
         # flags
         flags = ('x11', 'pulseaudio', 'wayland', 'dri')
         if self.mode == ConfigMode.replace:
@@ -359,6 +361,8 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
     bwrap_chdir = ['--chdir', sandbox_cwd_expanded]
 
     bwrap_flags = config.arguments.bwrap
+    if config.hostname:
+        bwrap_flags += ["--hostname", config.hostname]
     if run := config.arguments.command:
         if isinstance(run, str):
             run = [run]
@@ -414,6 +418,8 @@ def serialize_config(config: Config) -> str:
     #
     if config.sandbox_cwd:
         data['sandbox-cwd'] = config.sandbox_cwd
+    if config.hostname is not None:
+        data['hostname'] = config.hostname
 
     return json.dumps(data, indent=4)
 
@@ -477,6 +483,7 @@ def deserialize_config(text: str) -> Config:
         mounts=mounts,
         environment=env,
         arguments=args,
+        hostname = data.get('hostname'),
         sandbox_cwd=data.get('sandbox-cwd', default_config.sandbox_cwd),
         x11=data.get('x11', data.get('flags', {}).get('x11', False)),  # these flags.set. - is for some backwards compat
         pulseaudio=data.get('pulseaudio', data.get('flags', {}).get('set', {}).get('pulseaudio', False)),
