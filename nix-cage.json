@@ -1,3 +1,29 @@
 {
-    "mounts": {"rw": [["./.config", "~/.config", "d"]]}
+    "arguments": {
+        "run": "fish",
+        "bwrap": []
+    },
+    "mounts": {
+        "rw": [
+            [
+                ".",
+                "~/workspace"
+            ]
+        ],
+        "ro": [
+            [
+                "~/.nix-profile",
+                "~/.nix-profile"
+            ],
+            [
+                "~/.config/fish/",
+                "~/.config/fish/"
+            ]
+        ],
+        "tmpfs": [
+            "~"
+        ]
+    },
+    "sandbox-cwd": "~/workspace",
+    "hostname": "localhost"
 }

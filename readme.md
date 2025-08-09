@@ -46,6 +46,10 @@ This way you can easily implement simple sandboxing for any particular project.
 Running just `nix-cage` will look for the config file in current directory and all dirs above and do whatever thise configurations say.
 Passing arguments can still override any of the config values.
 
+## TODOs
+
+- Minimize inherited environment variables.
+
 ## License
 
 [Unlicense](https://unlicense.org/)

@@ -529,7 +529,22 @@ def ensure_prerequisites(config: Config):
             os.makedirs(path, exist_ok=True)
 
 
-def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False, merge_default: bool = True) -> Config:
+def override_config_with_shell(config, shell):
+    if shell == "bash":
+        config.mounts.ro.append(BindDefinition(
+            path_from='~/.bashrc',
+            path_to='~/.bashrc')
+        )
+    elif shell == "fish":
+        config.mounts.ro.append(BindDefinition(
+            path_from='~/.config/fish/',
+            path_to='~/.config/fish/')
+        )
+    else:
+        print(f"Warning: unsupported shell {shell}! Not setting up shell-specific mounts.")
+
+
+def get_noconfig_config(minimal: bool = False, shell: str = "bash", bind_gtk: bool = False, merge_default: bool = True) -> Config:
     """
     generate the default config to apply when nix-cage is run in a directory
     :return:
@@ -573,7 +588,7 @@ def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False, merge_def
         environment={},
         arguments=ConfigArguments(
             bwrap=[],
-            command='',
+            command=shell,
         ),
         sandbox_cwd='~/workspace',
     ))
@@ -584,10 +599,8 @@ def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False, merge_def
             BindDefinition(
                 path_from='~/.nix-profile',
                 path_to='~/.nix-profile'),
-            BindDefinition(
-                path_from='~/.bashrc',
-                path_to='~/.bashrc'),
         ])
+        override_config_with_shell(config, shell)
         if bind_gtk:
             for path in (
                 '~/.config/gtk-2.0',
@@ -605,6 +618,8 @@ def get_noconfig_config(minimal: bool = False, bind_gtk: bool = False, merge_def
                 )
     return config
 
+def get_current_shell_name():
+    return os.path.basename(os.path.realpath(f'/proc/{os.getppid()}/exe'))
 
 def override_config_with_arguments(config, arguments, command_args):
     if arguments.command or command_args:
@@ -662,7 +677,7 @@ def main(argv: List[str]):
     p.add_argument("--config", help="config file path")
     p.add_argument("--command", help="command to execute inside the sandbox")
     p.add_argument("--show-config", help="dumps config in readable form and exit", action="store_true")
-    p.add_argument("--write-default-config", help="saves default config into nix-cage.json and exit", action="store_true")
+    p.add_argument("--write-default-config", help="saves default config into nix-cage.json with current shell as the command", action="store_true")
     p.add_argument("--verbose", help="print too much information", action="store_true")
     p.add_argument("--cd", "-C", help="change to directory before doing anything", default=os.getcwd())
     p.add_argument("--x11", help="bind some stuff to enable x11", action=BooleanOptionalAction)
@@ -717,7 +732,8 @@ def main(argv: List[str]):
         print(config)
         return
     if arguments.write_default_config:
-        config = get_noconfig_config(bind_gtk=arguments.x11 or arguments.wayland, merge_default=False)
+        shell = get_current_shell_name()
+        config = get_noconfig_config(shell=shell, bind_gtk=arguments.x11 or arguments.wayland, merge_default=False)
         override_config_with_arguments(config, arguments, command_args)
 
         config_path = Path(arguments.config or 'nix-cage.json')
