@@ -692,6 +692,7 @@ def main(argv: List[str]):
         argv = argv[:sep_i]
     arguments = p.parse_args(argv)
 
+    shell = get_current_shell_name()
     user = getpwnam(os.environ["USER"])
     os.environ["UID"] = str(user.pw_uid)
     os.environ["GID"] = str(user.pw_gid)
@@ -707,17 +708,12 @@ def main(argv: List[str]):
         try:
             config = load_config(Path('nix-cage.json'))
         except NoConfigFoundError:
-            config = None
-        if config is None and command_args:
             # default behaviour when called without config present at all
             # bind gtk config only if something about graphics was requested
-            config = get_noconfig_config(bind_gtk=arguments.x11 or arguments.wayland)
+            config = get_noconfig_config(shell=shell, bind_gtk=arguments.x11 or arguments.wayland)
     else:
         # if config was explicitly provided - no config found is a critical error
         config = load_config(Path(arguments.config))
-
-    if config is None:
-        raise RuntimeError('no config to run nix-cage. provide a binary to run to use default minimal config')
 
     #
     # override config
@@ -732,7 +728,6 @@ def main(argv: List[str]):
         print(config)
         return
     if arguments.write_default_config:
-        shell = get_current_shell_name()
         config = get_noconfig_config(shell=shell, bind_gtk=arguments.x11 or arguments.wayland, merge_default=False)
         override_config_with_arguments(config, arguments, command_args)
 
