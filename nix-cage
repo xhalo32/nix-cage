@@ -428,7 +428,8 @@ def serialize_config(config: Config) -> str:
 def deserialize_config(text: str) -> Config:
     default_config = Config.get_default_config()
 
-    data = json.loads(text)
+    # Removes comments before parsing json
+    data = json.loads(re.sub("//.*", "", text, flags=re.MULTILINE))
 
     mounts = ConfigMounts([], [], [], [])
     if mounts_data := data.get('mounts'):
