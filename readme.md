@@ -49,6 +49,8 @@ Passing arguments can still override any of the config values.
 ## TODOs
 
 - Minimize inherited environment variables.
+- Allow failure option for mounts
+- Option to copy instead of mount (but don't overwrite)
 
 ## License
 

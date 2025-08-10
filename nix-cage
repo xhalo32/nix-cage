@@ -331,7 +331,8 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
     if config.pulseaudio:
         mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/pulse'))
     if config.wayland:
-        mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/wayland-0'))
+        wayland_display=base_env.get('WAYLAND_DISPLAY', 'wayland-0')
+        mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/{wayland_display}'))
     if config.dri:
         mount_config.ro.append(BindDefinition("/run/opengl-driver"))
     else:
@@ -694,7 +695,7 @@ def main(argv: List[str]):
 
     shell = get_current_shell_name()
     user = getpwnam(os.environ["USER"])
-    os.environ["UID"] = str(user.pw_uid)
+    os.environ["UID"] = str(user.pw_uid) # TODO fresh environment
     os.environ["GID"] = str(user.pw_gid)
 
     arguments.cd = os.path.abspath(os.path.expanduser(arguments.cd))
