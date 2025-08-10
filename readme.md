@@ -17,7 +17,9 @@ Unlike the original repo, this fork is more about creating ad-hoc sandboxes and 
 
 You can just run
 
-`nix-cage -- bash`
+```
+nix-cage
+```
 
 With this you will enter a bash shell in a simple sandbox environment, where among other things, your home will be a tmpfs,
 and current directory, in where you ran the comand above, will be binded to `~/workspace` inside the sandbox.
@@ -39,7 +41,12 @@ If you want to enable that - you can provide one or more of the following flags 
 
 ## Advanced use
 
-You can specify additional file bindings and custom commands to run using configuration file (`nix-cage.json`)
+You can specify additional file bindings and custom commands to run using configuration file (`nix-cage.json`).
+You can generate a `nix-cage.json` using the following command:
+
+```
+nix-cage --write-default-config
+```
 
 This way you can easily implement simple sandboxing for any particular project.
 
@@ -51,6 +58,16 @@ Passing arguments can still override any of the config values.
 - Minimize inherited environment variables.
 - Allow failure option for mounts
 - Option to copy instead of mount (but don't overwrite)
+- BUG: when inside a `nix-shell`, running `nix-shell` in the cage results in `error: creating directory '/tmp/nix-shell.0a8nM7/nix-shell-2-0': No such file or directory`. This is probably due to the temporary directory env vars:
+    ```
+    env |grep tmp
+    TEMPDIR=/tmp/nix-shell.v6TFSv
+    TMPDIR=/tmp/nix-shell.v6TFSv
+    TEMP=/tmp/nix-shell.v6TFSv
+    NIX_BUILD_TOP=/tmp/nix-shell.v6TFSv
+    TMP=/tmp/nix-shell.v6TFSv
+    ```
+    One fix could be to not inherit TMPDIR variables.
 
 ## License
 
