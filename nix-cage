@@ -64,9 +64,9 @@ class ConfigMounts:
         linesep = '\n'
         return ('MOUNTS:\n'
                 f'  RW   :\n{linesep.join([f"    {x}" for x in self.rw])}\n'
-                f'  RO   :\n{linesep.join([f"    {x}" for x in self.rw])}\n'
-                f'  DEV  :\n{linesep.join([f"    {x}" for x in self.rw])}\n'
-                f'  TMPFS:\n{linesep.join([f"    {x}" for x in self.rw])}')
+                f'  RO   :\n{linesep.join([f"    {x}" for x in self.ro])}\n'
+                f'  DEV  :\n{linesep.join([f"    {x}" for x in self.dev])}\n'
+                f'  TMPFS:\n{linesep.join([f"    {x}" for x in self.tmpfs])}')
 
 
 @dataclass
@@ -96,6 +96,7 @@ class Config:
     wayland: Optional[bool] = None
     pulseaudio: Optional[bool] = None
     dri: Optional[bool] = None
+    network: Optional[bool] = None
 
     def __str__(self):
         return ('CONFIG:\n'
@@ -107,6 +108,7 @@ class Config:
                 f' {"wayland" if self.wayland else "no-wayland"}'
                 f' {"pulseaudio" if self.pulseaudio else "no-pulseaudio"}'
                 f' {"dri" if self.dri else "no-dri"}'
+                f' {"network" if self.network else "no-network"}'
                 '\n'
                 f'{self.mounts}\n'
                 f'{self.arguments}\n'
@@ -137,7 +139,11 @@ class Config:
             BindDefinition("/"),
             BindDefinition("/run/current-system/sw"),
         ]
-        dev = [BindDefinition("/dev")]  # TODO: this is too permissive
+        dev = [BindDefinition(path) for path in (
+            "/dev/null", "/dev/zero", "/dev/full",
+            "/dev/random", "/dev/urandom",
+            "/dev/tty", "/dev/pts", "/dev/ptmx", "/dev/shm",
+        )]
         tmpfs = [BindDefinition(x) for x in (
             "/tmp",
             "/home",
@@ -160,10 +166,13 @@ class Config:
         set_from_env("HOME", env)
         set_from_env("TERM", env)
         set_from_env("SHELL", env)
+        set_from_env("PATH", env)
+        set_from_env("USER", env)
+        set_from_env("LANG", env)
         set_from_env("NIX_REMOTE", env)
 
         if "NIX_REMOTE" not in env:
-            rw.extend([BindDefinition(path) for path in (
+            ro.extend([BindDefinition(path) for path in (
                 os.environ.get("NIX_STORE_DIR", "/nix/store"),
                 os.environ.get("NIX_LOG_DIR", "/nix/var/log/nix"),
                 os.environ.get("NIX_STATE_DIR", "/nix/var/nix"),
@@ -176,6 +185,8 @@ class Config:
                 "--unshare-cgroup",
                 "--unshare-uts",
                 "--unshare-pid",
+                "--unshare-net",
+                "--clearenv",
                 "--proc", "/proc",
             ],
         )
@@ -198,7 +209,7 @@ class Config:
     def merge(self, other: "Config"):
         if self.mode == ConfigMode.expand:
             self.mounts.merge(other.mounts)
-            self.arguments.bwrap.extend(other.arguments.bwrap)  # TODO: this should have some kind of a check
+            self.arguments.bwrap.extend(validate_bwrap_args(other.arguments.bwrap))
             if other.arguments.command:
                 self.arguments.command = other.arguments.command
         else:
@@ -210,7 +221,7 @@ class Config:
             if (val := getattr(other, option)) is not None:
                 setattr(self, option, val)
         # flags
-        flags = ('x11', 'pulseaudio', 'wayland', 'dri')
+        flags = ('x11', 'pulseaudio', 'wayland', 'dri', 'network')
         if self.mode == ConfigMode.replace:
             for flag in flags:
                 if (other_flag := getattr(other, flag)) is not None:
@@ -222,6 +233,33 @@ class Config:
                     setattr(self, flag, getattr(other, flag))
                 else:
                     setattr(self, flag, my_flag and getattr(other, flag))
+
+
+DENIED_BWRAP_ARGS = {
+    '--bind': 2, '--ro-bind': 2, '--dev-bind': 2,
+    '--bind-try': 2, '--ro-bind-try': 2, '--dev-bind-try': 2,
+    '--share-net': 0,
+    '--userns': 1, '--userns2': 1,
+    '--uid': 1, '--gid': 1,
+    '--exec-label': 1, '--file-label': 1,
+    '--cap-add': 1,
+}
+
+
+def validate_bwrap_args(args: List[str]) -> List[str]:
+    """Filter out denied bwrap args, printing warnings for any removed."""
+    filtered = []
+    i = 0
+    while i < len(args):
+        if args[i] in DENIED_BWRAP_ARGS:
+            skip = DENIED_BWRAP_ARGS[args[i]]
+            denied_parts = args[i:i + 1 + skip]
+            print(f"Warning: denied bwrap argument removed: {' '.join(denied_parts)}", file=sys.stderr)
+            i += 1 + skip
+        else:
+            filtered.append(args[i])
+            i += 1
+    return filtered
 
 
 def split_mount_suffix(path_with_suffix_maybe) -> Tuple[str, Optional[str]]:
@@ -253,7 +291,7 @@ def _mounts_to_bwrap_flags(mounts: ConfigMounts, sandbox_cwd: str) -> List[str]:
     ):
         for mount in mounts_list:
             bind_flag_parts.append(
-                (( '--perms', f'0{mount.premissions_octal:o}') if mount.permissions_octal is not None else ()) + \
+                (( '--perms', f'0{mount.permissions_octal:o}') if mount.permissions_octal is not None else ()) + \
                 (
                     bw_flag,
                     os.path.abspath(mount.path_from or mount.path_to),
@@ -263,7 +301,7 @@ def _mounts_to_bwrap_flags(mounts: ConfigMounts, sandbox_cwd: str) -> List[str]:
 
     for mount in mounts.tmpfs:
         bind_flag_parts.append(
-            (( '--perms', f'0{mount.premissions_octal:o}') if mount.permissions_octal is not None else ()) + \
+            (( '--perms', f'0{mount.permissions_octal:o}') if mount.permissions_octal is not None else ()) + \
             ('--tmpfs', mount.path_to if os.path.isabs(mount.path_to) else os.path.join(sandbox_cwd, mount.path_to))
         )
 
@@ -301,14 +339,19 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
     bwrap_env = copy(config.environment)
     base_env = dict(os.environ)
     expanded_something = True
+    max_iterations = len(bwrap_env) + 1
+    iterations = 0
     while expanded_something:
-        # Note, if there are loops in env dependency graph - this will go infinite
+        if iterations >= max_iterations:
+            print("Warning: possible circular env var references, stopping expansion", file=sys.stderr)
+            break
         expanded_something = False
         for key, val in bwrap_env.items():
             expanded_val = expand_vars(val, base_env | bwrap_env)
             if expanded_val != val:
                 expanded_something = True
                 bwrap_env[key] = expanded_val
+        iterations += 1
 
     # calc final sandbox_cwd
     host_home = os.path.expanduser('~')
@@ -334,10 +377,8 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
         wayland_display=base_env.get('WAYLAND_DISPLAY', 'wayland-0')
         mount_config.ro.append(BindDefinition(f'/run/user/{base_env["UID"]}/{wayland_display}'))
     if config.dri:
+        mount_config.dev.append(BindDefinition("/dev/dri"))
         mount_config.ro.append(BindDefinition("/run/opengl-driver"))
-    else:
-        # by default, the whole /dev is binded, so this we unbind
-        mount_config.tmpfs.append(BindDefinition('/dev/dri'))
 
     # mount args for bwrap
 
@@ -362,6 +403,8 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
     bwrap_chdir = ['--chdir', sandbox_cwd_expanded]
 
     bwrap_flags = config.arguments.bwrap
+    if config.network:
+        bwrap_flags = [f for f in bwrap_flags if f != '--unshare-net']
     if config.hostname:
         bwrap_flags += ["--hostname", config.hostname]
     if run := config.arguments.command:
@@ -378,7 +421,7 @@ def make_command(config: Config) -> Tuple[str, List[str]]:
 
     return (
         bwrap_command,
-        [os.path.basename(bwrap_command)] + bwrap_mounts + bwrap_env_args + bwrap_chdir + bwrap_flags + run_args
+        [os.path.basename(bwrap_command)] + bwrap_flags + bwrap_mounts + bwrap_env_args + bwrap_chdir + run_args
     )
 
 
@@ -396,7 +439,7 @@ def serialize_config(config: Config) -> str:
         'bwrap': config.arguments.bwrap,
     }
     # flags
-    for name in ('x11', 'wayland', 'pulseaudio', 'dri'):
+    for name in ('x11', 'wayland', 'pulseaudio', 'dri', 'network'):
         flag = getattr(config, name)
         if flag is None:  # not set
             continue
@@ -478,7 +521,7 @@ def deserialize_config(text: str) -> Config:
         if args_data_command := args_data.get('run', args_data.get('command')):  # command and run mean the same
             args.command = args_data_command
         if args_data_bwrap := args_data.get('bwrap'):
-            args.bwrap = args_data_bwrap
+            args.bwrap = validate_bwrap_args(args_data_bwrap)
 
     return Config(
         mode=ConfigMode(data['mode']) if 'mode' in data else ConfigMode.expand,
@@ -491,6 +534,7 @@ def deserialize_config(text: str) -> Config:
         pulseaudio=data.get('pulseaudio', data.get('flags', {}).get('set', {}).get('pulseaudio', False)),
         wayland=data.get('wayland', data.get('flags', {}).get('set', {}).get('wayland', False)),
         dri=data.get('dri', data.get('flags', {}).get('set', {}).get('dri', False)),
+        network=data.get('network', data.get('flags', {}).get('set', {}).get('network', False)),
     )
 
 
@@ -648,6 +692,8 @@ def override_config_with_arguments(config, arguments, command_args):
         config.wayland = arguments.wayland
     if arguments.dri is not None:
         config.dri = arguments.dri
+    if arguments.network is not None:
+        config.network = arguments.network
 
 
 def main(argv: List[str]):
@@ -686,6 +732,7 @@ def main(argv: List[str]):
     p.add_argument("--pulseaudio", help="bind some stuff to enable pulseaudio", action=BooleanOptionalAction)
     p.add_argument("--wayland", help="bind some stuff to enable wayland", action=BooleanOptionalAction)
     p.add_argument("--dri", help="bind /dev/dri", action=BooleanOptionalAction)
+    p.add_argument("--network", help="allow network access (isolated by default)", action=BooleanOptionalAction)
 
     command_args = []
     if '--' in argv:
