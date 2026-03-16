@@ -68,6 +68,12 @@ Passing arguments can still override any of the config values.
     TMP=/tmp/nix-shell.v6TFSv
     ```
     One fix could be to not inherit TMPDIR variables.
+- Stop gpg from doing silly things
+    ```
+    gpg-connect-agent: failed to create temporary file '/home/niklash/.gnupg/.#lk0x000056078b227270.localhost.369': No such file or directory
+    gpg-connect-agent: can't connect to the gpg-agent: No such file or directory
+    gpg-connect-agent: error sending standard options: No agent running
+    ```
 
 ## License
 
